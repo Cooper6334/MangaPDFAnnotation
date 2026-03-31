@@ -35,9 +35,9 @@ def process_manga_folder(folder_path: str):
         print(f"and place it in: {MODEL_PATH.parent}")
         return None
 
-    # 建立帶時間戳記的輸出資料夾
+    # 建立帶時間戳記的輸出資料夾（統一放在 results/ 下）
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(__file__).parent / f"result_{timestamp}"
+    output_dir = Path(__file__).parent / "results" / f"result_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_txv = output_dir / "result.txv"
 

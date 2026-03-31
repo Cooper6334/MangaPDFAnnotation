@@ -16,6 +16,9 @@ comic-text-detector/
 # OCR 輸出結果
 *.txv
 
+# 環境變數（含 API Key）
+.env
+
 # OS
 .DS_Store
 Thumbs.db
