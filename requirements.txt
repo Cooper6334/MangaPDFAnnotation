@@ -1,0 +1,24 @@
+# ============================================================
+# 安裝步驟
+# ============================================================
+#
+# 1. 安裝 Python 套件
+#    pip install -r requirements.txt
+#
+# 2. Clone comic-text-detector（不是標準 PyPI 套件）
+#    git clone https://github.com/dmMaze/comic-text-detector.git
+#
+# 3. 下載偵測模型 comictextdetector.pt.onnx
+#    下載網址：https://github.com/zyddnys/manga-image-translator/releases/tag/beta-0.2.1
+#    下載後放至：comic-text-detector/data/comictextdetector.pt.onnx
+#
+# ============================================================
+
+manga-ocr
+opencv-python
+Pillow
+torch
+tqdm
+numpy
+pyclipper
+shapely

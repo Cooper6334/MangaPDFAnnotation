@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# comic-text-detector (clone 自外部 repo，不納入版控)
+comic-text-detector/
+
+# 模型權重
+*.pt
+*.onnx
+
+# OCR 輸出結果
+*.txv
+
+# OS
+.DS_Store
+Thumbs.db
