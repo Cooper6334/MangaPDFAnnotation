@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QScrollArea, QLabel, QTextEdit, QFrame, QFileDialog,
     QMessageBox, QToolBar, QSizePolicy, QLineEdit, QPushButton,
-    QCheckBox,
+    QCheckBox, QComboBox,
     # QButtonGroup, QRadioButton,  # 套用範圍選項暫時隱藏
 )
 from PySide6.QtGui import QPixmap, QFont, QAction, QColor, QPalette
@@ -21,30 +21,38 @@ from PySide6.QtCore import Qt, QThread, Signal
 # ---------------------------------------------------------------------------
 
 class OcrWorker(QThread):
+    """呼叫 ocr.py，即時將 stdout 轉發至 log signal；支援資料夾與 PDF 路徑。"""
     finished = Signal(str)   # result folder path
-    error = Signal(str)
+    error    = Signal(str)
+    log      = Signal(str)   # 即時進度行
 
-    def __init__(self, folder_path: str):
+    def __init__(self, path: str):
         super().__init__()
-        self.folder_path = folder_path
+        self.path = path
 
     def run(self):
         import subprocess
         script = Path(__file__).parent / "ocr.py"
         try:
-            result = subprocess.run(
-                [sys.executable, str(script), self.folder_path],
-                capture_output=True,
+            proc = subprocess.Popen(
+                [sys.executable, "-u", str(script), self.path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # stderr 合併進 stdout 一起即時顯示
                 text=True,
                 encoding="utf-8",
                 errors="replace",
             )
-            for line in result.stdout.splitlines():
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    self.log.emit(line)
                 if "Results saved to" in line:
                     folder = line.split("Results saved to")[-1].strip()
+                    proc.wait()
                     self.finished.emit(folder)
                     return
-            self.error.emit(result.stderr or "OCR 結束但找不到輸出資料夾。")
+            proc.wait()
+            self.error.emit("OCR 結束但找不到輸出資料夾。")
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -64,83 +72,192 @@ class TranslateWorker(QThread):
     """
     finished = Signal(object)
     error = Signal(str)
+    log   = Signal(str)
 
-    def __init__(self, rows: list[tuple[str, str, str]], result_dir: Path):
-        """rows: [(filename, index, jp_text), ...]"""
+    def __init__(self, rows: list[tuple[str, str, str]], result_dir: Path,
+                 backend: str = "claude"):
+        """rows: [(filename, index, jp_text), ...]; backend: 'claude' | 'gemini'"""
         super().__init__()
         self.rows = rows
         self.result_dir = result_dir
+        self.backend = backend
+
+    BATCH_SIZE = 20  # 每批翻譯筆數
 
     def run(self):
         import subprocess
 
-        # ── 1. 將待翻譯資料寫成 JSON 檔案，供 skill 讀取 ─────────────────
         input_path = self.result_dir / "translate_input.json"
-        input_path.write_text(
-            json.dumps(
-                [{"filename": f, "index": i, "text": t} for f, i, t in self.rows],
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        batches = [
+            self.rows[i: i + self.BATCH_SIZE]
+            for i in range(0, len(self.rows), self.BATCH_SIZE)
+        ]
+        total_batches = len(batches)
+        all_translations: dict = {}
 
-        # ── 2. 呼叫 translate-manga skill ────────────────────────────────
+        for batch_idx, batch in enumerate(batches):
+            self.log.emit(f"── 翻譯第 {batch_idx + 1}/{total_batches} 批（{len(batch)} 筆）[{self.backend}] ──")
+
+            # ── 1. 寫入本批輸入 JSON ──────────────────────────────────────
+            input_path.write_text(
+                json.dumps(
+                    [{"filename": f, "index": i, "text": t} for f, i, t in batch],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            output_path = self.result_dir / f"translate_output_{batch_idx}.json"
+            output_path.unlink(missing_ok=True)
+
+            # ── 2. 依 backend 呼叫翻譯指令 ───────────────────────────────
+            if self.backend == "claude":
+                items = self._run_claude(batch_idx, input_path, output_path)
+            else:
+                items = self._run_gemini(batch_idx, input_path)
+
+            if items is None:
+                return
+
+            for item in items:
+                all_translations[(item["filename"], str(item["index"]))] = {
+                    "translation": item.get("translation", ""),
+                    "ai_message":  item.get("ai_message", ""),
+                }
+
+            self.log.emit(f"[第 {batch_idx + 1} 批完成，累計 {len(all_translations)} 筆]")
+
+        self.finished.emit(all_translations)
+
+    # ── backend helpers ───────────────────────────────────────────────────
+
+    def _run_claude(self, batch_idx: int, input_path: Path, output_path: Path):
+        """呼叫 claude CLI，透過 skill 翻譯並儲存至 output_path。回傳 items 或 None。"""
+        import subprocess
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 [
                     "claude",
-                    "--allowedTools", "Read",
-                    "-p", f"/translate-manga {input_path}",
+                    "--allowedTools", "Read,Write,Bash",
+                    "--output-format", "stream-json",
+                    "-p", f"/translate-manga {input_path} {output_path}",
                 ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=180,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
             )
         except FileNotFoundError:
             self.error.emit("找不到 `claude` 指令。\n請確認 Claude Code CLI 已安裝並在 PATH 中。")
-            return
-        except subprocess.TimeoutExpired:
-            self.error.emit("claude 指令逾時（180 秒）。")
-            return
+            return None
 
-        if result.returncode != 0:
+        output_lines: list[str] = []
+        for raw_line in proc.stdout:
+            raw_line = raw_line.rstrip()
+            if not raw_line:
+                continue
+            output_lines.append(raw_line)
+            try:
+                event = json.loads(raw_line)
+                etype = event.get("type", "")
+                if etype == "assistant":
+                    for block in event.get("message", {}).get("content", []):
+                        if block.get("type") == "text":
+                            text = block["text"].strip()
+                            if text:
+                                self.log.emit(text)
+                        elif block.get("type") == "tool_use":
+                            self.log.emit(f"[工具呼叫] {block.get('name','?')}")
+                elif etype == "result" and event.get("subtype") == "error":
+                    self.log.emit(f"[錯誤] {event.get('error','')}")
+            except json.JSONDecodeError:
+                self.log.emit(raw_line)
+
+        proc.wait()
+        if proc.returncode != 0:
             self.error.emit(
-                f"claude 指令失敗（return code {result.returncode}）：\n"
-                f"{result.stderr or result.stdout}"
+                f"claude 指令失敗（第 {batch_idx + 1} 批，return code {proc.returncode}）：\n"
+                + "\n".join(output_lines[-20:])
             )
-            return
+            return None
 
-        # ── 3. 解析 JSON 回應 ─────────────────────────────────────────────
-        raw = result.stdout.strip()
-        print(f"[TranslateWorker] claude raw output ({len(raw)} chars):\n{raw[:800]}")
-
-        match = re.search(r"\[.*\]", raw, re.DOTALL)
-        if not match:
+        if not output_path.exists():
             self.error.emit(
-                f"無法從 claude 回應中解析 JSON 陣列。\n\n原始回應（前 800 字）：\n{raw[:800]}"
+                f"第 {batch_idx + 1} 批：找不到輸出檔案 {output_path.name}。\n\n"
+                + "\n".join(output_lines[-20:])
             )
-            return
+            return None
 
         try:
-            items = json.loads(match.group())
+            return json.loads(output_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            self.error.emit(
-                f"JSON 解析錯誤：{exc}\n\n原始回應（前 800 字）：\n{raw[:800]}"
-            )
-            return
+            self.error.emit(f"第 {batch_idx + 1} 批 JSON 解析錯誤：{exc}")
+            return None
 
-        translations = {
-            (item["filename"], str(item["index"])): {
-                "translation": item.get("translation", ""),
-                "ai_message": item.get("ai_message", ""),
-            }
-            for item in items
-        }
-        print(f"[TranslateWorker] parsed {len(translations)} translations")
-        self.finished.emit(translations)
+    def _run_gemini(self, batch_idx: int, input_path: Path):
+        """呼叫 gemini CLI，將 prompt+JSON 直接嵌入，從 stdout 解析結果。回傳 items 或 None。"""
+        import subprocess
+
+        # 讀取術語表
+        glossary_path = Path(__file__).parent / "glossary.txt"
+        glossary = ""
+        if glossary_path.exists():
+            lines = [
+                l for l in glossary_path.read_text(encoding="utf-8").splitlines()
+                if l.strip() and not l.startswith("#")
+            ]
+            glossary = "\n".join(lines) if lines else "（無）"
+        else:
+            glossary = "（無）"
+
+        input_json = input_path.read_text(encoding="utf-8")
+        rules = (Path(__file__).parent / "translate-prompt.md").read_text(encoding="utf-8")
+
+        prompt = (
+            f"以下是待翻譯的漫畫 OCR JSON 陣列：\n\n{input_json}\n\n"
+            f"術語表：\n{glossary}\n\n"
+            f"{rules}\n\n"
+            "只輸出純 JSON 陣列，不要任何說明文字、不要 markdown 包裝。"
+        )
+
+        try:
+            proc = subprocess.Popen(
+                ["gemini", "-p", prompt],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+            )
+        except FileNotFoundError:
+            self.error.emit("找不到 `gemini` 指令。\n請確認 Gemini CLI 已安裝：npm install -g @google/gemini-cli")
+            return None
+
+        output_lines: list[str] = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            output_lines.append(line)
+            if line:
+                self.log.emit(line)
+
+        proc.wait()
+        if proc.returncode != 0:
+            self.error.emit(
+                f"gemini 指令失敗（第 {batch_idx + 1} 批，return code {proc.returncode}）：\n"
+                + "\n".join(output_lines[-20:])
+            )
+            return None
+
+        raw = "\n".join(output_lines)
+        match = re.search(r"\[.*?\]", raw, re.DOTALL)
+        if not match:
+            self.error.emit(
+                f"第 {batch_idx + 1} 批（Gemini）無法解析 JSON 陣列。\n\n原始回應（前 800 字）：\n{raw[:800]}"
+            )
+            return None
+
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError as exc:
+            self.error.emit(f"第 {batch_idx + 1} 批（Gemini）JSON 解析錯誤：{exc}")
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -165,8 +282,9 @@ class _ClickableImage(QLabel):
 class RowWidget(QWidget):
     """
     每列佈局：
-      編號 | 截圖 | 日文原文   | AI訊息     | 已確認 checkbox
-                 | 繁體中文   |            | 重新OCR 按鈕（未實作）
+      編號 | 截圖 | 日文原文   | AI訊息     | 需翻譯 checkbox
+                 | 繁體中文   |            | 已確認 checkbox
+                                           | 重新OCR 按鈕（未實作）
     """
 
     IMG_W = 130
@@ -181,6 +299,7 @@ class RowWidget(QWidget):
         image_path: Path,
         ai_message: str = "",
         confirmed: bool = False,
+        need_translate: bool = True,
     ):
         super().__init__()
         self.filename = filename
@@ -243,9 +362,14 @@ class RowWidget(QWidget):
         self._update_ai_style(bool(ai_message))
         outer.addWidget(self.ai_edit, 1)
 
-        # ── 已確認 checkbox + 重新OCR 按鈕 ──────────────────────────────
+        # ── 需翻譯 / 已確認 checkbox + 重新OCR 按鈕 ─────────────────────
         right_col = QVBoxLayout()
         right_col.setSpacing(4)
+
+        self.translate_cb = QCheckBox("需翻譯")
+        self.translate_cb.setChecked(need_translate)
+        self.translate_cb.setFixedWidth(72)
+        right_col.addWidget(self.translate_cb)
 
         self.confirm_cb = QCheckBox("已確認")
         self.confirm_cb.setChecked(confirmed)
@@ -276,7 +400,7 @@ class RowWidget(QWidget):
 
     # ── public helpers ────────────────────────────────────────────────────
     def get_row(self) -> tuple:
-        """回傳 (filename, index, jp, zh, ai_message, confirmed)。"""
+        """回傳 (filename, index, jp, zh, ai_message, confirmed, need_translate)。"""
         return (
             self.filename,
             self.index,
@@ -284,6 +408,7 @@ class RowWidget(QWidget):
             self.zh_edit.toPlainText(),
             self.ai_edit.toPlainText(),
             "1" if self.confirm_cb.isChecked() else "0",
+            "1" if self.translate_cb.isChecked() else "0",
         )
 
     def set_translation(self, zh: str, ai_message: str = ""):
@@ -327,6 +452,8 @@ class MainWindow(QMainWindow):
         self.row_widgets: list[RowWidget] = []
         self._ocr_worker: OcrWorker | None = None
         self._translate_worker: TranslateWorker | None = None
+        # key: (filename, index) → (page_num, pdf_x1, pdf_y1, pdf_x2, pdf_y2)
+        self._coord_map: dict[tuple[str, str], tuple[int, float, float, float, float]] = {}
 
         self._build_toolbar()
         self._build_central()
@@ -348,6 +475,11 @@ class MainWindow(QMainWindow):
         act_src.triggered.connect(self._on_open_source)
         tb.addAction(act_src)
 
+        act_pdf = QAction(style.standardIcon(QStyle.SP_FileIcon), "開啟PDF", self)
+        act_pdf.setToolTip("選擇 PDF 漫畫檔，自動執行 OCR 並載入結果（支援輸出標注 PDF）")
+        act_pdf.triggered.connect(self._on_open_pdf)
+        tb.addAction(act_pdf)
+
         tb.addSeparator()
 
         act_result = QAction(style.standardIcon(QStyle.SP_DialogOpenButton), "讀取", self)
@@ -357,8 +489,14 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        self.cmb_backend = QComboBox()
+        self.cmb_backend.addItems(["Claude", "Gemini"])
+        self.cmb_backend.setFixedWidth(90)
+        self.cmb_backend.setToolTip("選擇翻譯方案")
+        tb.addWidget(self.cmb_backend)
+
         self.act_translate = QAction(style.standardIcon(QStyle.SP_MessageBoxInformation), "翻譯", self)
-        self.act_translate.setToolTip("透過 translate-manga skill 將日文翻譯為繁體中文")
+        self.act_translate.setToolTip("將日文翻譯為繁體中文")
         self.act_translate.triggered.connect(self._on_translate)
         self.act_translate.setEnabled(False)
         tb.addAction(self.act_translate)
@@ -370,7 +508,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_save)
 
         self.act_export = QAction(style.standardIcon(QStyle.SP_ArrowForward), "輸出", self)
-        self.act_export.setToolTip("輸出功能尚未實作")
+        self.act_export.setToolTip("將翻譯結果以便利貼 annotation 加回 original.pdf（僅 PDF 專案可用）")
         self.act_export.triggered.connect(self._on_export)
         self.act_export.setEnabled(False)
         tb.addAction(self.act_export)
@@ -450,19 +588,29 @@ class MainWindow(QMainWindow):
     # Toolbar actions
     # ------------------------------------------------------------------
 
-    def _on_open_source(self):
-        folder = QFileDialog.getExistingDirectory(self, "選擇漫畫圖片資料夾")
-        if not folder:
-            return
-        self._set_status("OCR 執行中，請稍候…", busy=True)
+    def _start_ocr(self, path: str, label: str):
+        self._set_status(f"{label}，請稍候…")
         self.act_save.setEnabled(False)
         self.act_export.setEnabled(False)
         self.act_translate.setEnabled(False)
 
-        self._ocr_worker = OcrWorker(folder)
+        self._ocr_worker = OcrWorker(path)
         self._ocr_worker.finished.connect(self._on_ocr_done)
         self._ocr_worker.error.connect(self._on_ocr_error)
+        self._ocr_worker.log.connect(self._log)
         self._ocr_worker.start()
+
+    def _on_open_source(self):
+        folder = QFileDialog.getExistingDirectory(self, "選擇漫畫圖片資料夾")
+        if folder:
+            self._start_ocr(folder, "OCR 執行中")
+
+    def _on_open_pdf(self):
+        pdf_file, _ = QFileDialog.getOpenFileName(
+            self, "選擇漫畫 PDF", "", "PDF 檔案 (*.pdf)"
+        )
+        if pdf_file:
+            self._start_ocr(pdf_file, "OCR 執行中（PDF）")
 
     def _on_ocr_done(self, result_folder: str):
         self._set_status("OCR 完成")
@@ -483,22 +631,24 @@ class MainWindow(QMainWindow):
         if not self.row_widgets:
             return
 
-        # 收集所有日文文字
+        # 收集勾選「需翻譯」且有日文內容的列
         rows_to_translate = [
             (rw.filename, rw.index, rw.jp_edit.toPlainText())
             for rw in self.row_widgets
-            if rw.jp_edit.toPlainText().strip()
+            if rw.translate_cb.isChecked() and rw.jp_edit.toPlainText().strip()
         ]
         if not rows_to_translate:
             return
 
-        self._set_status(f"翻譯中（共 {len(rows_to_translate)} 筆）…", busy=True)
         self.act_translate.setEnabled(False)
         self.act_save.setEnabled(False)
 
-        self._translate_worker = TranslateWorker(rows_to_translate, self.result_dir)
+        backend = self.cmb_backend.currentText().lower()
+        self._set_status(f"翻譯中（共 {len(rows_to_translate)} 筆，{backend}）…")
+        self._translate_worker = TranslateWorker(rows_to_translate, self.result_dir, backend)
         self._translate_worker.finished.connect(self._on_translate_done)
         self._translate_worker.error.connect(self._on_translate_error)
+        self._translate_worker.log.connect(self._log)
         self._translate_worker.start()
 
     def _on_translate_done(self, translations):
@@ -563,16 +713,79 @@ class MainWindow(QMainWindow):
         if not self.result_dir:
             return
         out = self.result_dir / "result_translated.txv"
+        has_coords = bool(self._coord_map)
         with open(out, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f, delimiter="\t")
-            writer.writerow(["圖檔檔名", "第幾筆", "文字內容", "翻譯結果", "AI訊息", "已確認"])
+            header = ["圖檔檔名", "第幾筆", "文字內容", "翻譯結果", "AI訊息", "已確認", "需翻譯"]
+            if has_coords:
+                header += ["page_num", "pdf_x1", "pdf_y1", "pdf_x2", "pdf_y2"]
+            writer.writerow(header)
             for rw in self.row_widgets:
-                writer.writerow(rw.get_row())
+                filename, index, jp, zh, ai_msg, confirmed, need_translate = rw.get_row()
+                row = [filename, index, jp, zh, ai_msg, confirmed, need_translate]
+                if has_coords:
+                    coords = self._coord_map.get((rw.filename, rw.index))
+                    if coords:
+                        page_num, x1, y1, x2, y2 = coords
+                        row += [page_num, f"{x1:.2f}", f"{y1:.2f}", f"{x2:.2f}", f"{y2:.2f}"]
+                    else:
+                        row += ["", "", "", "", ""]
+                writer.writerow(row)
         self._set_status(f"已儲存 → {out.name}")
 
     def _on_export(self):
-        # TODO: 實作輸出功能
-        pass
+        if not self.result_dir:
+            return
+
+        original_pdf = self.result_dir / "original.pdf"
+        if not original_pdf.exists():
+            QMessageBox.warning(self, "無法輸出",
+                                "此專案非 PDF 來源（找不到 original.pdf）。\n"
+                                "請使用「開啟PDF」建立專案。")
+            return
+
+        if not self._coord_map:
+            QMessageBox.warning(self, "無法輸出",
+                                "沒有 PDF 座標資料。\n"
+                                "請確認是否由「開啟PDF」建立的專案，且 result.txv 含有座標欄位。")
+            return
+
+        try:
+            import fitz
+        except ImportError:
+            QMessageBox.critical(self, "缺少套件", "請先安裝 pymupdf：\npip install pymupdf")
+            return
+
+        try:
+            doc = fitz.open(str(original_pdf))
+            count = 0
+
+            for rw in self.row_widgets:
+                filename, index, jp, zh, ai_msg, confirmed, need_translate = rw.get_row()
+                zh = zh.strip()
+                if not zh:
+                    continue
+
+                coords = self._coord_map.get((filename, index))
+                if not coords:
+                    continue
+
+                page_num, pdf_x1, pdf_y1, pdf_x2, pdf_y2 = coords
+                page = doc[page_num]
+
+                # 便利貼 annotation 置於文字框左上角
+                point = fitz.Point(pdf_x1, pdf_y1)
+                annot = page.add_text_annot(point, zh, icon="Note")
+                annot.update()
+                count += 1
+
+            doc.saveIncr()   # 增量儲存回 original.pdf
+            self._set_status(f"已輸出 {count} 筆便利貼標注 → {original_pdf.name}")
+            QMessageBox.information(self, "輸出完成",
+                                    f"已加入 {count} 筆便利貼標注\n→ {original_pdf}")
+
+        except Exception as exc:
+            QMessageBox.critical(self, "輸出錯誤", str(exc))
 
     # ------------------------------------------------------------------
     # Load & render
@@ -587,28 +800,42 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "錯誤", f"找不到 result.txv：\n{result_dir}")
             return
 
-        rows: list[tuple[str, str, str, str, bool]] = []
+        self._coord_map = {}
+        rows = []
         with open(txv, newline="", encoding="utf-8") as f:
             reader = csv.reader(f, delimiter="\t")
             header = next(reader, [])
-            has_zh        = len(header) >= 4
-            has_ai        = len(header) >= 5
-            has_confirmed = len(header) >= 6
+            col = {name: idx for idx, name in enumerate(header)}
             for row in reader:
                 if len(row) < 3:
                     continue
-                filename, index, jp = row[0], row[1], row[2]
-                zh        = row[3] if has_zh        and len(row) >= 4 else ""
-                ai_msg    = row[4] if has_ai        and len(row) >= 5 else ""
-                confirmed = row[5] == "1" if has_confirmed and len(row) >= 6 else False
-                rows.append((filename, index, jp, zh, ai_msg, confirmed))
+                filename      = row[0]
+                index         = row[1]
+                jp            = row[2]
+                zh            = row[col["翻譯結果"]]  if "翻譯結果" in col and len(row) > col["翻譯結果"]  else ""
+                ai_msg        = row[col["AI訊息"]]    if "AI訊息"   in col and len(row) > col["AI訊息"]    else ""
+                confirmed     = row[col["已確認"]] == "1" if "已確認" in col and len(row) > col["已確認"] else False
+                need_translate = row[col["需翻譯"]] != "0" if "需翻譯" in col and len(row) > col["需翻譯"] else True
+                if "page_num" in col:
+                    pi = col["page_num"]
+                    try:
+                        if len(row) > pi + 4 and row[pi] != "":
+                            self._coord_map[(filename, index)] = (
+                                int(row[pi]),
+                                float(row[pi + 1]), float(row[pi + 2]),
+                                float(row[pi + 3]), float(row[pi + 4]),
+                            )
+                    except ValueError:
+                        pass
+                rows.append((filename, index, jp, zh, ai_msg, confirmed, need_translate))
 
         self.result_dir = result_dir
         self._render_rows(rows)
         self.act_save.setEnabled(True)
-        self.act_export.setEnabled(True)
+        self.act_export.setEnabled(bool(self._coord_map))
         self.act_translate.setEnabled(True)
-        self._set_status(f"{result_dir.name}　共 {len(rows)} 筆")
+        pdf_note = f"　含 {len(self._coord_map)} 筆PDF座標" if self._coord_map else ""
+        self._set_status(f"{result_dir.name}　共 {len(rows)} 筆{pdf_note}")
 
     def _render_rows(self, rows: list[tuple[str, str, str, str]]):
         # clear previous content
@@ -620,7 +847,7 @@ class MainWindow(QMainWindow):
 
 
         current_file = None
-        for filename, index, jp, zh, ai_msg, confirmed in rows:
+        for filename, index, jp, zh, ai_msg, confirmed, need_translate in rows:
             if filename != current_file:
                 current_file = filename
                 self.vbox.addWidget(SectionHeader(filename))
@@ -628,7 +855,8 @@ class MainWindow(QMainWindow):
             stem = Path(filename).stem
             img_path = self.result_dir / f"{stem}_{index}.jpg"
             rw = RowWidget(filename, index, jp, zh, img_path,
-                           ai_message=ai_msg, confirmed=confirmed)
+                           ai_message=ai_msg, confirmed=confirmed,
+                           need_translate=need_translate)
             self.row_widgets.append(rw)
             self.vbox.addWidget(rw)
 

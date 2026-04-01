@@ -25,3 +25,4 @@ numpy
 pyclipper
 shapely
 PySide6
+pymupdf
